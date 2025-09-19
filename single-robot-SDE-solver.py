@@ -161,17 +161,26 @@ class EquationAnalyzer:
     def normalize_and_filter_equations(self) -> None:
         """Normalizes and filters the equation data, handling columns with zero variance."""
         scaler = StandardScaler()
+        # Find columns with non-zero variance
+        valid_cols = self.df.columns[(self.df != 0).any(axis=0)]
+        if valid_cols.empty:
+            logger.warning("All columns have zero variance after initial filtering. Skipping scaling.")
+            return
+
+        # Filter the DataFrame to only include these columns
+        self.df = self.df[valid_cols]
+
         scaled_values = scaler.fit_transform(self.df.values)
         normalized_df = pd.DataFrame(scaled_values, columns=self.df.columns, index=self.df.index).fillna(0)
 
-        self.df = normalized_df.loc[(self.df.sum(axis=1) != -1)]
-        self.df = self.df.loc[:, (self.df != 0).any(axis=0)]
+        # Re-filter based on the specified condition
+        self.df = normalized_df.loc[(normalized_df.sum(axis=1) != -1)]
         logger.info(f"Filtered equation data shape: {self.df.shape}")
 
-    def generate_monte_carlo_samples(self, num_samples: int = 100) -> None:
+    def generate_monte_carlo_samples(self, num_samples: int = 100) -> pd.DataFrame:
         """Generates new coefficient samples using a Monte Carlo method."""
-        self.monte_carlo_samples = pd.DataFrame(np.zeros((num_samples, len(self.df.columns))),
-                                                columns=self.df.columns)
+        samples_df = pd.DataFrame(np.zeros((num_samples, len(self.df.columns))),
+                                  columns=self.df.columns)
 
         for column in self.df.columns:
             mean_val, std_dev = self.df[column].mean(), self.df[column].std()
@@ -181,21 +190,23 @@ class EquationAnalyzer:
                 current_mean = self.df[column].iloc[i % len(self.df)]
                 noise = np.random.normal(loc=0, scale=std_dev * 0.01)
                 sample = np.clip(current_mean + noise, min_val, max_val)
-                self.monte_carlo_samples.loc[i, column] = sample
+                samples_df.loc[i, column] = sample
 
-        logger.info(f"Generated Monte Carlo samples with shape {self.monte_carlo_samples.shape}")
+        logger.info(f"Generated Monte Carlo samples with shape {samples_df.shape}")
+        return samples_df
 
-    def find_similar_coefficients(self, threshold: float = 1.0) -> pd.DataFrame:
+    def find_similar_coefficients(self, samples_df: pd.DataFrame, threshold: float = 1.0) -> pd.DataFrame:
         """Finds generated coefficients that are similar to the original ones."""
-        if self.df.empty or self.monte_carlo_samples.empty:
+        if self.df.empty or samples_df.empty:
             raise ValueError("DataFrames for comparison are empty.")
 
-        distances = pairwise_distances(self.df, self.monte_carlo_samples)
+        distances = pairwise_distances(self.df, samples_df)
         similar_rows_indices = np.where(distances < threshold)[1]
-        similar_coefficients_df = self.monte_carlo_samples.iloc[np.unique(similar_rows_indices)]
+        similar_coefficients_df = samples_df.iloc[np.unique(similar_rows_indices)]
 
         logger.info(f"Found {len(similar_coefficients_df)} similar coefficient sets.")
         return similar_coefficients_df
+
 
 class EquationConstructor:
     """
@@ -323,7 +334,7 @@ class ODESolver:
             return solution
         except Exception as e:
             logger.error(f"Error while solving ODE system: {e}")
-            raise
+            return None
 
 
 class SolutionManager:
@@ -338,8 +349,7 @@ class SolutionManager:
         df = pd.DataFrame({'t': time_points, 'x': solution[:, 0], 'y': solution[:, 1]})
         filename = self.output_path / f'solution_{object_id}_part_{part_idx + 1}.csv'
         df.to_csv(filename, index=False)
-        # Assuming logger is defined elsewhere
-        # logger.info(f"Solution segment saved to {filename}")
+        logger.info(f"Solution segment saved to {filename}")
 
     def save_combined_solution(self, solutions: List[np.ndarray], time_points: np.ndarray, object_id: int) -> None:
         """Saves the combined trajectory solution to a CSV file."""
@@ -347,8 +357,7 @@ class SolutionManager:
         df = pd.DataFrame({'t': time_points, 'x': combined_solution[:, 0], 'y': combined_solution[:, 1]})
         filename = self.output_path / f'solution_{object_id}_combined.csv'
         df.to_csv(filename, index=False)
-        # Assuming logger is defined elsewhere
-        # logger.info(f"Combined solution saved to {filename}")
+        logger.info(f"Combined solution saved to {filename}")
 
     def save_equation_coefficients(self, equations: List[Tuple[Dict, Dict]], object_id: int) -> None:
         """
@@ -380,8 +389,35 @@ class SolutionManager:
         df = pd.DataFrame(coeff_data)
         filename = self.output_path / f'coefficients_{object_id}.csv'
         df.to_csv(filename, index=False)
-        # Assuming logger is defined elsewhere
-        # logger.info(f"Equation coefficients saved to {filename}")
+        logger.info(f"Equation coefficients saved to {filename}")
+
+    def save_numpy_and_tensor(self, data: np.ndarray, filename: str) -> None:
+        """Saves a numpy array as a .npy file and a PyTorch tensor."""
+        numpy_path = self.output_path / (filename + '.npy')
+        torch_path = self.output_path / (filename + '.pt')
+
+        np.save(numpy_path, data)
+        torch.save(torch.from_numpy(data).float(), torch_path)
+        logger.info(f"Solution saved in .npy and .pt formats: {numpy_path}, {torch_path}")
+
+
+def average_solutions(solutions_list: List[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
+    """Calculates the element-wise average and standard deviation of a list of solutions."""
+    if not solutions_list:
+        return np.array([]), np.array([])
+
+    # Pad solutions with NaNs to make them all the same length
+    max_len = max(sol.shape[0] for sol in solutions_list)
+    padded_solutions = np.array(
+        [np.pad(sol, ((0, max_len - sol.shape[0]), (0, 0)), 'constant', constant_values=np.nan) for sol in
+         solutions_list])
+
+    # Calculate the mean and std, ignoring NaNs
+    mean_solution = np.nanmean(padded_solutions, axis=0)
+    std_solution = np.nanstd(padded_solutions, axis=0)
+
+    return mean_solution, std_solution
+
 
 def main():
     """Main function to execute the entire robot trajectory analysis workflow."""
@@ -393,6 +429,7 @@ def main():
     FREQUENCY = 1
     MAX_POINTS = 2750
     NUM_SEGMENTS = 3
+    NUM_MONTE_CARLO_SAMPLES = 10  # Number of different equation systems to solve
 
     CSV_FILENAMES = [f'output_{OBJECT_ID}_part_{i}.csv' for i in range(1, NUM_SEGMENTS + 1)]
 
@@ -412,76 +449,112 @@ def main():
         equation_analyzer.load_equation_data(CSV_FILENAMES)
         equation_analyzer.analyze_equation_patterns()
         equation_analyzer.normalize_and_filter_equations()
-        equation_analyzer.generate_monte_carlo_samples()
-        similar_coefficients_df = equation_analyzer.find_similar_coefficients()
 
-        if similar_coefficients_df.empty:
-            logger.warning("No similar coefficients were found. Using the mean of original coefficients as a fallback.")
-            similar_coefficients_df = pd.DataFrame([equation_analyzer.df.mean()], columns=equation_analyzer.df.columns)
-
-        # --- 3. Equation Construction ---
-        logger.info("--- Stage 3: Constructing Equations ---")
+        # --- 3. Equation Construction and Solver setup ---
+        logger.info("--- Stage 3: Preparing for Monte Carlo Simulations ---")
         equation_constructor = EquationConstructor()
-        equation_systems = equation_constructor.construct_equation_systems(similar_coefficients_df)
-
-        # --- 4. Solving ODE Systems for Each Segment ---
-        logger.info("--- Stage 4: Solving ODE System for All Segments ---")
         ode_solver = ODESolver()
         solution_manager = SolutionManager(OUTPUT_PATH)
-        solution_manager.save_equation_coefficients(equation_systems, OBJECT_ID)
 
-        all_solutions = []
-        for seg_idx, (t_seg, x_seg, y_seg) in enumerate(segments):
-            logger.info(f"Solving segment {seg_idx + 1}/{NUM_SEGMENTS}...")
+        # Lists to store solutions from all Monte Carlo runs
+        all_mc_solutions = []
 
-            x0, y0 = (x_seg[0], y_seg[0]) if seg_idx == 0 else (all_solutions[-1][-1, 0], all_solutions[-1][-1, 1])
+        # --- 4. Monte Carlo Simulation Loop ---
+        logger.info(f"--- Stage 4: Solving ODE System for {NUM_MONTE_CARLO_SAMPLES} Monte Carlo Samples ---")
+        for i in range(NUM_MONTE_CARLO_SAMPLES):
+            logger.info(f"--- Starting Monte Carlo Run {i + 1}/{NUM_MONTE_CARLO_SAMPLES} ---")
 
-            b_op_x = ode_solver.create_boundary_operator('x', 0, [None], t_seg[0], x0)
-            b_op_y = ode_solver.create_boundary_operator('y', 1, [None], t_seg[0], y0)
+            # Generate new coefficients for this run
+            monte_carlo_samples_df = equation_analyzer.generate_monte_carlo_samples(num_samples=1)
 
-            equation_set = equation_systems[seg_idx % len(equation_systems)]
+            # Find similar coefficients (or use the generated one if no similarity is found)
+            similar_coefficients_df = equation_analyzer.find_similar_coefficients(monte_carlo_samples_df)
+            if similar_coefficients_df.empty:
+                similar_coefficients_df = monte_carlo_samples_df
 
-            # This line is correct. equation_set is a tuple, so use integer indices.
-            solution = ode_solver.solve_system(
-                equations={'x': equation_set[0], 'y': equation_set[1]},
-                grids=[torch.from_numpy(t_seg).float()],
-                boundary_conditions=[b_op_y, b_op_x]
-            )
-            all_solutions.append(solution)
-            solution_manager.save_solution(solution, t_seg, OBJECT_ID, seg_idx)
+            equation_systems = equation_constructor.construct_equation_systems(similar_coefficients_df)
 
-            plt.figure(figsize=(10, 6))
-            plt.plot(t_seg, solution[:, 0], label='x (solved)')
-            plt.plot(t_seg, solution[:, 1], label='y (solved)')
-            plt.plot(t_seg, x_seg, '--', label='x (original)')
-            plt.plot(t_seg, y_seg, '--', label='y (original)')
-            plt.title(f'Solution for Segment {seg_idx + 1} (Object {OBJECT_ID})')
-            plt.xlabel('Time')
-            plt.ylabel('Coordinates')
-            plt.legend()
-            plt.savefig(OUTPUT_PATH / f'solution_segment_{OBJECT_ID}_{seg_idx + 1}.png')
-            plt.close()
+            # Store coefficients for this run
+            solution_manager.save_equation_coefficients(equation_systems, f'{OBJECT_ID}_mc_run_{i+1}')
 
-        # --- 5. Saving and Visualizing Combined Solution ---
-        logger.info("--- Stage 5: Finalizing and Saving Combined Solution ---")
-        solution_manager.save_combined_solution(all_solutions, t_full, OBJECT_ID)
+            current_run_solutions = []
+            for seg_idx, (t_seg, x_seg, y_seg) in enumerate(segments):
+                x0, y0 = (x_seg[0], y_seg[0]) if seg_idx == 0 else (
+                current_run_solutions[-1][-1, 0], current_run_solutions[-1][-1, 1])
 
-        combined_solution = np.vstack(all_solutions)
+                b_op_x = ode_solver.create_boundary_operator('x', 0, [None], t_seg[0], x0)
+                b_op_y = ode_solver.create_boundary_operator('y', 1, [None], t_seg[0], y0)
+
+                # Use the first equation set from the generated list
+                equation_set = equation_systems[0]
+
+                solution = ode_solver.solve_system(
+                    equations={'x': equation_set[0], 'y': equation_set[1]},
+                    grids=[torch.from_numpy(t_seg).float()],
+                    boundary_conditions=[b_op_y, b_op_x]
+                )
+
+                if solution is not None:
+                    current_run_solutions.append(solution)
+                else:
+                    logger.warning(f"Solution for segment {seg_idx + 1} failed. Skipping this run.")
+                    current_run_solutions = []
+                    break  # Break out of the segment loop for this run
+
+            if current_run_solutions:
+                combined_run_solution = np.vstack(current_run_solutions)
+                all_mc_solutions.append(combined_run_solution)
+
+        if not all_mc_solutions:
+            logger.error("No successful Monte Carlo simulations were completed. Exiting.")
+            return
+
+        # --- 5. Averaging Solutions and Final Output ---
+        logger.info("--- Stage 5: Averaging Solutions and Saving Results ---")
+        avg_solution, std_solution = average_solutions(all_mc_solutions)
+
+        # Save the average solution as a numpy array and tensor
+        solution_manager.save_numpy_and_tensor(avg_solution, f'average_solution_{OBJECT_ID}')
+        solution_manager.save_numpy_and_tensor(std_solution, f'std_deviation_solution_{OBJECT_ID}')
+
+        # Save the combined average solution to a CSV for plotting
+        df_avg = pd.DataFrame({'t': t_full[:len(avg_solution)], 'x': avg_solution[:, 0], 'y': avg_solution[:, 1]})
+        df_avg.to_csv(OUTPUT_PATH / f'average_solution_{OBJECT_ID}_combined.csv', index=False)
+        logger.info(f"Average solution saved to {OUTPUT_PATH / f'average_solution_{OBJECT_ID}_combined.csv'}")
+
+        # Visualize the average solution with original data and uncertainty
         plt.figure(figsize=(12, 8))
-        plt.plot(t_full, combined_solution[:, 0], label='x (full solution)')
-        plt.plot(t_full, combined_solution[:, 1], label='y (full solution)')
+        plt.plot(t_full, avg_solution[:, 0], label='x (average solution)')
+        plt.plot(t_full, avg_solution[:, 1], label='y (average solution)')
+        plt.fill_between(t_full[:len(avg_solution)], avg_solution[:, 0] - std_solution[:, 0],
+                         avg_solution[:, 0] + std_solution[:, 0], alpha=0.2, label='x uncertainty')
+        plt.fill_between(t_full[:len(avg_solution)], avg_solution[:, 1] - std_solution[:, 1],
+                         avg_solution[:, 1] + std_solution[:, 1], alpha=0.2, label='y uncertainty')
         plt.plot(t_full, x_full, '--', label='x (original data)', alpha=0.7)
         plt.plot(t_full, y_full, '--', label='y (original data)', alpha=0.7)
-        plt.title(f'Combined Solution for Object {OBJECT_ID}')
+        plt.title(f'Combined Average Solution for Object {OBJECT_ID}')
         plt.xlabel('Time')
         plt.ylabel('Coordinates')
         plt.legend()
-        plt.savefig(OUTPUT_PATH / f'combined_solution_{OBJECT_ID}.png')
+        plt.savefig(OUTPUT_PATH / f'average_combined_solution_{OBJECT_ID}.png')
         plt.close()
 
-        mse_x = np.mean((combined_solution[:, 0] - x_full) ** 2)
-        mse_y = np.mean((combined_solution[:, 1] - y_full) ** 2)
-        logger.info(f"Final Mean Squared Error: x={mse_x:.6f}, y={mse_y:.6f}")
+        # Plot the standard deviation for x and y separately
+        plt.figure(figsize=(12, 6))
+        plt.plot(t_full[:len(std_solution)], std_solution[:, 0], label='x std dev')
+        plt.plot(t_full[:len(std_solution)], std_solution[:, 1], label='y std dev')
+        plt.title('Standard Deviation of Solutions over Time')
+        plt.xlabel('Time')
+        plt.ylabel('Standard Deviation')
+        plt.legend()
+        plt.savefig(OUTPUT_PATH / f'std_deviation_plot_{OBJECT_ID}.png')
+        plt.close()
+
+        # Calculate final MSE with the average solution
+        avg_solution_len = min(len(avg_solution), len(x_full))
+        mse_x = np.mean((avg_solution[:avg_solution_len, 0] - x_full[:avg_solution_len]) ** 2)
+        mse_y = np.mean((avg_solution[:avg_solution_len, 1] - y_full[:avg_solution_len]) ** 2)
+        logger.info(f"Final Mean Squared Error (vs. Average Solution): x={mse_x:.6f}, y={mse_y:.6f}")
         logger.info("Workflow completed successfully.")
 
     except Exception as e:
@@ -490,6 +563,5 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
     
+
